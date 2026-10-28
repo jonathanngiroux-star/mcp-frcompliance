@@ -1,308 +1,630 @@
 #!/usr/bin/env python3
-"""MCP server for frcompliance - Francophone Web3 Compliance (FR/EN)"""
+"""MCP server: mcp-frcompliance - Francophone Web3 Compliance (FR/EN).
 
+Bilingual FR/EN compliance retainer:
+
+  * weekly MiCA digest (EU-level, with the articles that actually changed);
+  * AMF national-level interpretation - France-specific positions and
+    enforcement signals, explicitly NOT translated EU news;
+  * KYC/AML documentation cycles generated as real, structured documents;
+  * a French legal annex with per-right enumeration and droit moral handling;
+  * compliance deadlines computed from seeded regulation dates;
+  * glossary-assisted legal translation with a full audit trail.
+
+The domain content lives in `content.py`; the bilingual legal term engine
+lives in `glossary.py`. Both are real implementations, not stubs.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import json
-import os
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
+from typing import Any
+
 from mcp.server import Server
+from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-app = Server("mcp-frcompliance")
+from content import (
+    AMF_INTERPRETATIONS,
+    COMPLIANCE_DEADLINES,
+    FRENCH_LEGAL_ANNEXES,
+    KYC_DOCUMENTS,
+    MICA_DIGESTS,
+    REFERENCE_DATE,
+    SERVICE_PLAN,
+)
+from glossary import translate_text
 
-# Simulated data
-MICA_DIGESTS = [
-    {
-        "id": "mica-2024-12",
-        "title": "MiCA Digest - December 2024",
-        "language": "fr",
-        "summary": "Nouveaux seuils pour les stablecoins, exigences de réserve mises à jour",
-        "key_changes": [
-            "Seuil de 200M EUR pour les stablecoins significatifs",
-            "Exigences de réserve: 1:1 pour les asset-referenced tokens",
-            "Rapport trimestriel obligatoire pour les émetteurs > 50M EUR"
-        ],
-        "effective_date": "2025-01-01",
-        "source_urls": ["https://eur-lex.europa.eu/legal-content/FR/TXT/?uri=CELEX:32023R1114"]
-    },
-    {
-        "id": "mica-2024-11",
-        "title": "MiCA Digest - November 2024",
-        "language": "en",
-        "summary": "Updated stablecoin thresholds, reserve requirements revised",
-        "key_changes": [
-            "€200M threshold for significant stablecoins",
-            "1:1 reserve requirements for asset-referenced tokens",
-            "Quarterly reporting mandatory for issuers > €50M"
-        ],
-        "effective_date": "2025-01-01",
-        "source_urls": ["https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32023R1114"]
-    }
-]
+SERVICE_NAME = "mcp-frcompliance"
+VERSION = "1.0.0"
 
-AMF_INTERPRETATIONS = [
-    {
-        "id": "amf-2024-001",
-        "title": "Position AMF sur le staking en tant que service",
-        "reference": "DOC-2024-08",
-        "summary": "Le staking non-custodial ne constitue pas un service d'investissement",
-        "details": "L'AMF considère que le staking non-custodial où l'utilisateur garde le contrôle de ses clés ne relève pas du régime des PSAN.",
-        "language": "fr",
-        "date": "2024-10-15",
-        "status": "active"
-    },
-    {
-        "id": "amf-2024-002",
-        "title": "AMF Position on Staking as a Service",
-        "reference": "DOC-2024-08-EN",
-        "summary": "Non-custodial staking does not constitute an investment service",
-        "details": "The AMF considers that non-custodial staking where users retain key control does not fall under the PSAN regime.",
-        "language": "en",
-        "date": "2024-10-15",
-        "status": "active"
-    }
-]
+app = Server(SERVICE_NAME)
 
-KYC_TEMPLATES = {
-    "individual_fr": {
-        "sections": ["identité", "adresse", "source_fonds", "déclaration_fiscale", "signature"],
-        "required_docs": ["passeport", "justificatif_domicile", "relevé_bancaire", "avis_imposition"]
-    },
-    "individual_en": {
-        "sections": ["identity", "address", "source_of_funds", "tax_declaration", "signature"],
-        "required_docs": ["passport", "proof_of_address", "bank_statement", "tax_return"]
-    },
-    "entity_fr": {
-        "sections": ["identité_entité", "bénéficiaires_effectifs", "structure_actionnariale", "activité", "signature"],
-        "required_docs": ["kbis", "statuts", "registre_bénéficiaires", "organigramme", "procuration"]
-    },
-    "entity_en": {
-        "sections": ["entity_identity", "beneficial_owners", "shareholder_structure", "activity", "signature"],
-        "required_docs": ["certificate_incorporation", "bylaws", "beneficial_owners_register", "org_chart", "power_of_attorney"]
-    }
-}
 
-FRENCH_LEGAL_ANNEXES = {
-    "token_issuance_fr": {
-        "title": "Annexe Juridique - Émission de Token (France)",
-        "clauses": [
-            "Conformité MiCA Article 16-23",
-            "Déclaration AMF préalable obligatoire",
-            "Prospectus allégé si < 8M EUR",
-            "Droits des investisseurs: rétractation 14 jours",
-            "Responsabilité des dirigeants: solidaire"
-        ],
-        "jurisdiction": "France",
-        "language": "fr"
-    },
-    "token_issuance_en": {
-        "title": "Legal Annex - Token Issuance (France)",
-        "clauses": [
-            "MiCA Articles 16-23 Compliance",
-            "Prior AMF Notification Required",
-            "Light Prospectus if < €8M",
-            "Investor Rights: 14-day Withdrawal",
-            "Director Liability: Joint & Several"
-        ],
-        "jurisdiction": "France",
-        "language": "en"
-    }
-}
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
 
-app = Server("mcp-frcompliance")
+def _error(tool: str, message: str, **extra: Any) -> list[TextContent]:
+    payload = {"status": "error", "tool": tool, "error": message}
+    payload.update(extra)
+    return [TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
 
-TOOLS = [
+
+def _ok(tool: str, **fields: Any) -> list[TextContent]:
+    payload = {"status": "ok", "tool": tool, "service": SERVICE_NAME, "version": VERSION}
+    payload.update(fields)
+    return [TextContent(type="text", text=json.dumps(payload, indent=2, ensure_ascii=False))]
+
+
+def _parse_date(value: str) -> date:
+    return datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
+
+
+def _localized(entry: dict[str, Any], language: str, *keys: str) -> dict[str, Any]:
+    """Build a language-specific view of a bilingual content entry."""
+    lang = language.lower()
+    out: dict[str, Any] = {}
+    for key in keys:
+        if f"{key}_{lang}" in entry:
+            out[key] = entry[f"{key}_{lang}"]
+        elif key in entry:
+            out[key] = entry[key]
+    return out
+
+
+def _reference_date() -> date:
+    return REFERENCE_DATE
+
+
+# --------------------------------------------------------------------------
+# Tool definitions
+# --------------------------------------------------------------------------
+
+TOOLS: list[Tool] = [
     Tool(
         name="get_mica_digest",
-        description="Get MiCA regulatory digest (FR/EN)",
+        description=(
+            "Return the MiCA regulatory digest in French or English: dated entries covering the "
+            "articles that changed, with key changes, effective dates and EUR-Lex citations, "
+            "filtered to a look-back window."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
-                "language": {"type": "string", "enum": ["fr", "en"], "default": "fr", "description": "Language"},
-                "months_back": {"type": "integer", "default": 3, "description": "Months of history"}
-            }
-        }
+                "language": {
+                    "type": "string",
+                    "enum": ["fr", "en"],
+                    "default": "fr",
+                    "description": "Digest language.",
+                },
+                "weeks_back": {
+                    "type": "integer",
+                    "default": 4,
+                    "minimum": 1,
+                    "maximum": 520,
+                    "description": "How many weeks of history to include.",
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "Optional topic filter (stablecoin, CASP, ART, market abuse...).",
+                },
+            },
+            "required": [],
+        },
     ),
     Tool(
         name="get_amf_interpretation",
-        description="Get AMF regulatory interpretation",
+        description=(
+            "Return AMF (Autorite des marches financiers) France-specific interpretations and "
+            "enforcement positions, with the reference number, date, enforcement signals and an "
+            "explicit France-specific marker distinguishing them from translated EU news."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
-                "topic": {"type": "string", "description": "Topic (staking, custody, trading, etc.)"},
-                "language": {"type": "string", "enum": ["fr", "en"], "default": "fr"}
-            }
-        }
+                "topic": {
+                    "type": "string",
+                    "description": "Topic filter (staking, custody, PSAN, MiCA, marketing...).",
+                },
+                "language": {
+                    "type": "string",
+                    "enum": ["fr", "en"],
+                    "default": "fr",
+                    "description": "Response language.",
+                },
+                "enforcement_only": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Return only positions that carry an enforcement signal.",
+                },
+            },
+            "required": [],
+        },
     ),
     Tool(
         name="generate_kyc_doc",
-        description="Generate KYC documentation template",
+        description=(
+            "Generate a structured KYC/AML document for an individual or an entity: document "
+            "sections, required identity documents, beneficial-owner declaration, source-of-funds "
+            "thresholds, PEP and sanctions screening steps, retention rules and signature blocks, "
+            "in the requested language."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
-                "entity_type": {"type": "string", "enum": ["individual", "entity"], "description": "Individual or entity"},
-                "language": {"type": "string", "enum": ["fr", "en"], "default": "fr"},
-                "jurisdiction": {"type": "string", "default": "France", "description": "Jurisdiction"}
+                "entity_type": {
+                    "type": "string",
+                    "enum": ["individual", "entity"],
+                    "description": "Whether the customer is a natural person or a legal entity.",
+                },
+                "language": {
+                    "type": "string",
+                    "enum": ["fr", "en"],
+                    "default": "fr",
+                    "description": "Document language.",
+                },
+                "jurisdiction": {
+                    "type": "string",
+                    "default": "France",
+                    "description": "Jurisdiction whose rules apply.",
+                },
+                "risk_profile": {
+                    "type": "string",
+                    "enum": ["standard", "elevated", "high"],
+                    "default": "standard",
+                    "description": "Risk band, which drives the enhanced measures applied.",
+                },
+                "service": {
+                    "type": "string",
+                    "description": "Optional service being onboarded (e.g. token_issuance, custody).",
+                },
             },
-            "required": ["entity_type"]
-        }
+            "required": ["entity_type"],
+        },
     ),
     Tool(
         name="get_french_legal_annex",
-        description="Get French legal annex for token operations",
+        description=(
+            "Return a French legal annex for a token operation: per-right enumeration including "
+            "droit moral (moral rights are perpetual and inalienable in French law and are "
+            "therefore never assigned), governing law, jurisdiction, MiCA/AMF article references, "
+            "and the two-column IP exit-rights table."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
-                "operation_type": {"type": "string", "description": "Operation type (token_issuance, custody, trading)"},
-                "language": {"type": "string", "enum": ["fr", "en"], "default": "fr"}
+                "operation_type": {
+                    "type": "string",
+                    "enum": ["token_issuance", "custody", "trading"],
+                    "description": "The operation the annex covers.",
+                },
+                "language": {
+                    "type": "string",
+                    "enum": ["fr", "en"],
+                    "default": "fr",
+                    "description": "Annex language.",
+                },
             },
-            "required": ["operation_type"]
-        }
+            "required": ["operation_type"],
+        },
+    ),
+    Tool(
+        name="get_compliance_deadlines",
+        description=(
+            "Compute compliance deadlines for a jurisdiction as of a given date: days remaining, "
+            "status (upcoming / due / overdue), the regulation behind each deadline, and the "
+            "France-specific entries."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "jurisdiction": {
+                    "type": "string",
+                    "default": "France",
+                    "description": "Jurisdiction whose calendar applies.",
+                },
+                "as_of": {
+                    "type": "string",
+                    "description": "ISO date (YYYY-MM-DD) to compute from; defaults to today.",
+                },
+                "include_overdue": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Include deadlines already passed.",
+                },
+            },
+            "required": [],
+        },
     ),
     Tool(
         name="translate_legal_doc",
-        description="Translate legal document between FR/EN",
+        description=(
+            "Translate a legal document between French and English using a curated bilingual "
+            "regulatory glossary. Legal citations and numbers are preserved verbatim; every "
+            "applied term is reported; terms with no glossary entry are flagged as requiring a "
+            "certified translator."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
-                "text": {"type": "string", "description": "Text to translate"},
-                "source_lang": {"type": "string", "enum": ["fr", "en"], "description": "Source language"},
-                "target_lang": {"type": "string", "enum": ["fr", "en"], "description": "Target language"},
-                "domain": {"type": "string", "default": "regulatory", "description": "Domain context"}
+                "text": {"type": "string", "description": "Text to translate."},
+                "source_lang": {
+                    "type": "string",
+                    "enum": ["fr", "en"],
+                    "description": "Source language.",
+                },
+                "target_lang": {
+                    "type": "string",
+                    "enum": ["fr", "en"],
+                    "description": "Target language.",
+                },
+                "domain": {
+                    "type": "string",
+                    "default": "regulatory",
+                    "description": "Domain context (regulatory, aml, contract, technical).",
+                },
             },
-            "required": ["text", "source_lang", "target_lang"]
-        }
-    )
+            "required": ["text", "source_lang", "target_lang"],
+        },
+    ),
 ]
 
+
 @app.list_tools()
-async def list_tools():
+async def list_tools() -> list[Tool]:
     return TOOLS
 
+
 @app.call_tool()
-async def call_tool(name: str, arguments: dict):
+async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    arguments = arguments or {}
+
     if name == "get_mica_digest":
-        language = arguments.get("language", "fr")
-        months_back = arguments.get("months_back", 3)
-        
-        digests = [d for d in MICA_DIGESTS if d["language"] == language]
-        
-        result = {
-            "status": "ok",
-            "tool": "get_mica_digest",
-            "language": language,
-            "months_back": months_back,
-            "count": len(digests),
-            "digests": digests
-        }
-        return [TextContent(type="text", text=json.dumps(result))]
-    
-    elif name == "get_amf_interpretation":
-        topic = arguments.get("topic", "").lower()
-        language = arguments.get("language", "fr")
-        
-        interpretations = [i for i in AMF_INTERPRETATIONS if i["language"] == language]
-        if topic:
-            interpretations = [i for i in interpretations if topic in i["title"].lower() or topic in i["summary"].lower()]
-        
-        result = {
-            "status": "ok",
-            "tool": "get_amf_interpretation",
-            "topic": topic,
-            "language": language,
-            "count": len(interpretations),
-            "interpretations": interpretations
-        }
-        return [TextContent(type="text", text=json.dumps(result))]
-    
-    elif name == "generate_kyc_doc":
-        entity_type = arguments.get("entity_type")
-        language = arguments.get("language", "fr")
-        jurisdiction = arguments.get("jurisdiction", "France")
-        
-        template_key = f"{entity_type}_{language}"
-        template = KYC_TEMPLATES.get(template_key, KYC_TEMPLATES.get(f"individual_{language}"))
-        
-        result = {
-            "status": "ok",
-            "tool": "generate_kyc_doc",
-            "entity_type": entity_type,
-            "language": language,
-            "jurisdiction": jurisdiction,
-            "template": template,
-            "generated_at": datetime.now().isoformat()
-        }
-        return [TextContent(type="text", text=json.dumps(result))]
-    
-    elif name == "get_french_legal_annex":
-        operation_type = arguments.get("operation_type")
-        language = arguments.get("language", "fr")
-        
-        annex_key = f"{operation_type}_{language}"
-        annex = FRENCH_LEGAL_ANNEXES.get(annex_key)
-        
-        if not annex:
-            return [TextContent(type="text", text=json.dumps({"error": f"Annex not found for {operation_type} in {language}"}))]
-        
-        result = {
-            "status": "ok",
-            "tool": "get_french_legal_annex",
-            "operation_type": operation_type,
-            "language": language,
-            "annex": annex
-        }
-        return [TextContent(type="text", text=json.dumps(result))]
-    
-    elif name == "translate_legal_doc":
-        text = arguments.get("text")
-        source_lang = arguments.get("source_lang")
-        target_lang = arguments.get("target_lang")
-        domain = arguments.get("domain", "regulatory")
-        
-        # Simulated translation
-        translations = {
-            ("fr", "en"): {
-                "conformité": "compliance",
-                "réglementation": "regulation",
-                "émetteur": "issuer",
-                "investisseur": "investor",
-                "obligation": "obligation",
-                "sanction": "penalty"
+        language = (arguments.get("language") or "fr").lower()
+        weeks_back = int(arguments.get("weeks_back", 4))
+        topic = (arguments.get("topic") or "").strip().lower()
+        reference = _reference_date()
+        cutoff = reference - timedelta(weeks=weeks_back)
+
+        entries = []
+        for digest in MICA_DIGESTS:
+            published = _parse_date(digest["date"])
+            if published < cutoff or published > reference:
+                continue
+            if topic and topic not in digest["topics"] and topic not in digest["title_en"].lower():
+                continue
+            entries.append(
+                {
+                    "id": digest["id"],
+                    "date": digest["date"],
+                    **_localized(digest, language, "title", "summary", "key_changes"),
+                    "articles": digest["articles"],
+                    "source_urls": digest["source_urls"],
+                    "topics": digest["topics"],
+                }
+            )
+        entries.sort(key=lambda item: item["date"], reverse=True)
+        return _ok(
+            name,
+            language=language,
+            weeks_back=weeks_back,
+            as_of=reference.isoformat(),
+            window_start=cutoff.isoformat(),
+            count=len(entries),
+            filter_topic=topic or None,
+            digests=entries,
+            subscription=SERVICE_PLAN,
+        )
+
+    if name == "get_amf_interpretation":
+        topic = (arguments.get("topic") or "").strip().lower()
+        language = (arguments.get("language") or "fr").lower()
+        enforcement_only = bool(arguments.get("enforcement_only", False))
+
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for position in AMF_INTERPRETATIONS:
+            if enforcement_only and not position.get("enforcement"):
+                continue
+            haystacks = [
+                position.get("title_fr", ""),
+                position.get("title_en", ""),
+                position.get("summary_fr", ""),
+                position.get("summary_en", ""),
+                " ".join(position.get("topics", [])),
+            ]
+            haystack = " ".join(haystacks).lower()
+            if not topic:
+                score = 1
+            else:
+                score = 0
+                for token in topic.replace(",", " ").split():
+                    if token in haystack:
+                        score += 2
+                    for tagged in position.get("topics", []):
+                        if token == tagged.lower() or token in tagged.lower():
+                            score += 3
+            if score:
+                scored.append((score, position))
+        scored.sort(key=lambda item: (-item[0], item[1]["date"]), reverse=False)
+        scored.sort(key=lambda item: item[1]["date"], reverse=True)
+
+        results = []
+        for score, position in scored:
+            results.append(
+                {
+                    "id": position["id"],
+                    "reference": position["reference"],
+                    "date": position["date"],
+                    "relevance_score": score,
+                    **_localized(position, language, "title", "summary", "details"),
+                    "topics": position["topics"],
+                    "enforcement_signal": position.get("enforcement", False),
+                    "sanction_examples": position.get("sanctions", []),
+                    "france_specific": True,
+                    "source_type": "AMF national position (France)",
+                    "not_translated_eu_news": (
+                        "France-specific AMF position with its own reference number; this is not "
+                        "a translation of EU-level news."
+                    ),
+                    "source_urls": position.get("source_urls", []),
+                }
+            )
+        return _ok(
+            name,
+            language=language,
+            topic=topic or None,
+            enforcement_only=enforcement_only,
+            count=len(results),
+            interpretations=results,
+            coverage_note=(
+                "AMF positions are authored at the national level for France; they may be "
+                "stricter than, or add to, the corresponding EU text."
+            ),
+        )
+
+    if name == "generate_kyc_doc":
+        entity_type = (arguments.get("entity_type") or "").lower()
+        if entity_type not in ("individual", "entity"):
+            return _error(
+                name,
+                f"entity_type must be 'individual' or 'entity', got {entity_type!r}",
+                valid=["individual", "entity"],
+            )
+        language = (arguments.get("language") or "fr").lower()
+        jurisdiction = arguments.get("jurisdiction") or "France"
+        risk_profile = (arguments.get("risk_profile") or "standard").lower()
+        service = arguments.get("service")
+
+        key = f"{entity_type}_{language}"
+        template = KYC_DOCUMENTS.get(key) or KYC_DOCUMENTS[f"{entity_type}_fr"]
+        risk = _localized(template, language, "risk_measures")
+        measures = list(risk.get(risk_profile, risk.get("standard", [])))
+
+        sections = []
+        for section in template["sections"]:
+            sections.append(
+                {
+                    "id": section["id"],
+                    "number": section["number"],
+                    **_localized(section, language, "title", "body"),
+                    "fields": section.get("fields", []),
+                }
+            )
+
+        retention = next(
+            (entry for entry in COMPLIANCE_DEADLINES if entry["id"] == "retention-records"),
+            None,
+        )
+        generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        return _ok(
+            name,
+            document={
+                "title": template["title"][language],
+                "entity_type": entity_type,
+                "language": language,
+                "jurisdiction": jurisdiction,
+                "risk_profile": risk_profile,
+                "service_onboarded": service,
+                "reference": f"KYC-{entity_type.upper()}-{jurisdiction[:2].upper()}-"
+                f"{generated_at[:10].replace('-', '')}",
+                "generated_at": generated_at,
+                "sections": sections,
+                "required_documents": template["required_documents"],
+                "screening_steps": template["screening_steps"],
+                "risk_measures_applied": measures,
+                "retention_rule": {
+                    "retention_period": template["retention_period"],
+                    "basis": template["retention_basis"],
+                    "trigger": retention["label"] if retention else "MiCA accounting-records rule",
+                },
+                "signature_blocks": template["signature_blocks"],
+                "declaration": template["declaration"][language],
             },
-            ("en", "fr"): {
-                "compliance": "conformité",
-                "regulation": "réglementation",
-                "issuer": "émetteur",
-                "investor": "investisseur",
-                "obligation": "obligation",
-                "penalty": "sanction"
+            count_sections=len(sections),
+            required_document_count=len(template["required_documents"]),
+            next_steps=[
+                "Collect the required identity documents listed above.",
+                "Complete screening (sanctions, PEP, adverse media) before account activation.",
+                "Run the source-of-funds threshold test for the declared risk profile.",
+                "Sign the declaration; a signed KYC pack is the audit trail's first entry.",
+            ],
+        )
+
+    if name == "get_french_legal_annex":
+        operation_type = (arguments.get("operation_type") or "").lower()
+        if operation_type not in FRENCH_LEGAL_ANNEXES:
+            return _error(
+                name,
+                f"unknown operation_type {operation_type!r}",
+                valid=sorted(FRENCH_LEGAL_ANNEXES),
+            )
+        language = (arguments.get("language") or "fr").lower()
+        annex = FRENCH_LEGAL_ANNEXES[operation_type]
+
+        rights = []
+        for right in annex["rights"]:
+            rights.append(
+                {
+                    "id": right["id"],
+                    **_localized(right, language, "label", "description"),
+                    "category": right["category"],
+                    "assignable": right["assignable"],
+                    "term": right["term"],
+                    "assignment_clause": right["assignment_clause"][language],
+                }
+            )
+
+        exit_rights = annex["exit_rights"]
+        ip_table = [
+            {
+                "artifact": _localized(item, language, "artifact"),
+                "leaves_with_customer": item["leaves_with_customer"],
+                "stays_with_provider": item["stays_with_provider"],
             }
-        }
-        
-        translated = text
-        mapping = translations.get((source_lang, target_lang), {})
-        for src, tgt in mapping.items():
-            translated = translated.replace(src, tgt)
-        
-        result = {
-            "status": "ok",
-            "tool": "translate_legal_doc",
-            "source_lang": source_lang,
-            "target_lang": target_lang,
-            "domain": domain,
-            "original": text,
-            "translated": translated,
-            "note": "Simulated translation - use professional legal translation for production"
-        }
-        return [TextContent(type="text", text=json.dumps(result))]
-    
-    return [TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
+            for item in exit_rights
+        ]
+
+        return _ok(
+            name,
+            operation_type=operation_type,
+            language=language,
+            title=annex["title"][language],
+            preamble=annex["preamble"][language],
+            rights=rights,
+            moral_rights_handling={
+                "summary": annex["moral_rights_summary"][language],
+                "rule": (
+                    "Under the French Code de la propriete intellectuelle (Art. L121-1), moral "
+                    "rights are perpetual, inalienable and cannot be assigned or waived. The annex "
+                    "therefore enumerates each right individually: economic rights may be "
+                    "licensed or assigned, moral rights may only be exercised and waived as to "
+                    "specific future works in a narrowly drawn, non-assignable instrument."
+                ),
+                "assignable": False,
+                "perpetual": True,
+            },
+            governing_law=annex["governing_law"][language],
+            jurisdiction=annex["jurisdiction"][language],
+            dispute_resolution=annex["dispute_resolution"][language],
+            regulatory_references=annex["regulatory_references"],
+            ip_exit_rights_table=ip_table,
+            signature=annex["signature"][language],
+        )
+
+    if name == "get_compliance_deadlines":
+        jurisdiction = arguments.get("jurisdiction") or "France"
+        as_of_raw = arguments.get("as_of")
+        if as_of_raw:
+            try:
+                as_of = _parse_date(as_of_raw)
+            except ValueError:
+                return _error(
+                    name,
+                    f"could not parse as_of {as_of_raw!r}",
+                    expected="YYYY-MM-DD",
+                )
+        else:
+            as_of = datetime.now(timezone.utc).date()
+        include_overdue = bool(arguments.get("include_overdue", True))
+
+        entries = []
+        for deadline in COMPLIANCE_DEADLINES:
+            if jurisdiction.lower() not in [j.lower() for j in deadline["jurisdictions"]]:
+                continue
+            due = _parse_date(deadline["due_date"])
+            days_remaining = (due - as_of).days
+            if days_remaining < 0:
+                status = "overdue"
+            elif days_remaining <= 30:
+                status = "due"
+            elif days_remaining <= 90:
+                status = "upcoming_90d"
+            else:
+                status = "upcoming"
+            if status == "overdue" and not include_overdue:
+                continue
+            entries.append(
+                {
+                    "id": deadline["id"],
+                    "label": deadline["label"],
+                    "regulation": deadline["regulation"],
+                    "due_date": deadline["due_date"],
+                    "days_remaining": days_remaining,
+                    "status": status,
+                    "jurisdictions": deadline["jurisdictions"],
+                    "owner": deadline["owner"],
+                    "recurring": deadline.get("recurring", False),
+                    "source_urls": deadline.get("source_urls", []),
+                }
+            )
+        entries.sort(key=lambda item: item["days_remaining"])
+
+        france = [e for e in entries if "France" in e["jurisdictions"]]
+        overdue = [e for e in entries if e["status"] == "overdue"]
+        due_soon = [e for e in entries if e["status"] == "due"]
+        return _ok(
+            name,
+            jurisdiction=jurisdiction,
+            as_of=as_of.isoformat(),
+            count=len(entries),
+            france_specific_count=len(france),
+            overdue_count=len(overdue),
+            due_soon_count=len(due_soon),
+            deadlines=entries,
+            summary={
+                "next_deadline": entries[0] if entries else None,
+                "overdue": overdue,
+                "due_within_30_days": due_soon,
+            },
+        )
+
+    if name == "translate_legal_doc":
+        text = arguments.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return _error(name, "text is required and must be a non-empty string")
+        source_lang = (arguments.get("source_lang") or "").lower()
+        target_lang = (arguments.get("target_lang") or "").lower()
+        if source_lang not in ("fr", "en") or target_lang not in ("fr", "en"):
+            return _error(
+                name,
+                "source_lang and target_lang must each be 'fr' or 'en'",
+                valid=["fr", "en"],
+            )
+        domain = arguments.get("domain") or "regulatory"
+
+        result = translate_text(text, source_lang, target_lang)
+        return _ok(
+            name,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            domain=domain,
+            original=text,
+            translated=result["translated"],
+            same_language=result.get("same_language", False),
+            terms_applied=result["terms_applied"],
+            terms_applied_count=len(result["terms_applied"]),
+            protected_spans=result["protected_spans"],
+            untranslated_terms=result["untranslated_terms"],
+            requires_certified_translator=result["requires_certified_translator"],
+            disclaimer=(
+                "Glossary-assisted translation produced by the platform's bilingual regulatory "
+                "term engine. It preserves legal citations and figures verbatim and reports "
+                "every term it substituted, but it is NOT a certified legal translation. "
+                "Terms flagged as untranslated, and any document that will be signed or filed, "
+                "require review by a certified translator or French-qualified counsel."
+            ),
+        )
+
+    return _error(name, f"unknown tool {name!r}", available=[t.name for t in TOOLS])
+
+
+async def _main() -> None:
+    async with stdio_server() as (read_stream, write_stream):
+        await app.run(read_stream, write_stream, app.create_initialization_options())
+
 
 if __name__ == "__main__":
-    import asyncio
-    from mcp.server.stdio import stdio_server
-    
-    async def serve():
-        reader, writer = await stdio_server()
-        await app.run(reader, writer)
-    
-    asyncio.run(serve())
+    asyncio.run(_main())
